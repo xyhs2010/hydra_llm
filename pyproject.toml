@@ -1,0 +1,29 @@
+[project]
+name = "hydra-llm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.13.0",
+]
+
+[project.scripts]
+hydra-llm = "hydra_llm:main"
+
+[dependency-groups]
+dev = [
+    "nvidia-cuda-nvcc==13.2.86",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
