@@ -5,7 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "beautifulsoup4",
+    "datasets>=5.1.0",
+    "html2text",
+    "huggingface-hub>=2.2.0",
+    "nltk",
+    "tenacity",
     "torch==2.13.0",
+    "transformers",
+    "wonderwords",
 ]
 
 [project.scripts]

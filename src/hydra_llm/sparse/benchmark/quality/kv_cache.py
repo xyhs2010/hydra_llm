@@ -25,15 +25,24 @@ class KVCachePool:
     下次跑（换算法 / 加 sweep 轴）直接加载跳过 prefill。
     """
 
+    def __init__(self) -> None:
+        self._items: dict[str, KVCache] = {}
+
     def put(self, sample_id: str, kv: KVCache) -> None:
-        raise NotImplementedError
+        self._items[sample_id] = kv
 
     def get(self, sample_id: str) -> KVCache:
-        raise NotImplementedError
+        try:
+            return self._items[sample_id]
+        except KeyError:
+            raise KeyError(f"no KV cached for sample {sample_id!r}") from None
 
     def has(self, sample_id: str) -> bool:
-        raise NotImplementedError
+        return sample_id in self._items
 
     def drop(self, sample_id: str) -> None:
         """释放该样本占用的内存，腾预算给下一个样本。"""
-        raise NotImplementedError
+        self._items.pop(sample_id, None)
+
+    def __len__(self) -> int:
+        return len(self._items)

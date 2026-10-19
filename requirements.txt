@@ -1,1 +1,9 @@
+beautifulsoup4
+datasets>=5.1.0
+html2text
+huggingface-hub>=2.2.0
+nltk
+tenacity
 torch==2.13.0
+transformers
+wonderwords

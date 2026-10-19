@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local data & generated caches (large, re-derivable from code + upstream data)
+data/
