@@ -8,7 +8,9 @@
 
 from .data import Sample, SampleSource
 from .kv_cache import KVCache, KVCachePool
-from .metrics import DecodeResult, Metric
+from .loaders import load_pg19, load_ruler
+from .metrics import DecodeResult, Metric, answer_hits, ppl_metric, ruler_metric
+from .runner import run_ppl, run_ruler, summarize, summarize_by_depth
 
 __all__ = [
     "Sample",
@@ -17,4 +19,13 @@ __all__ = [
     "KVCachePool",
     "DecodeResult",
     "Metric",
+    "load_pg19",
+    "load_ruler",
+    "answer_hits",
+    "ppl_metric",
+    "ruler_metric",
+    "run_ppl",
+    "run_ruler",
+    "summarize",
+    "summarize_by_depth",
 ]

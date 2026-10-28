@@ -8,10 +8,21 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Protocol
 
 from .data import Sample
+
+# RULER task -> number of tokens to generate (from the official synthetic/constants.py)
+RULER_TOKENS_TO_GENERATE = {
+    "niah_single_2": 128,
+    "niah_multikey_1": 128,
+    "niah_multivalue": 128,
+    "niah_multiquery": 128,
+    "cwe": 120,
+    "fwe": 50,
+}
 
 
 class Tokenizer(Protocol):
@@ -67,6 +78,47 @@ def load_pg19(
                     "benchmark": "pg19",
                     "length": length,
                     "books": books,
+                },
+            )
+        )
+    return samples
+
+
+def load_ruler(
+    root: str | Path,
+    tokenizer,
+    *,
+    length: int,
+    task: str,
+    split: str = "test",
+) -> list[Sample]:
+    """Load one RULER (length, task) cell into Samples.
+
+    RULER's `input` already contains the full prompt (template + haystack +
+    question + answer prefix), so it fills `context_tokens` and
+    `query_tokens` stays empty. `outputs` is the reference list.
+    """
+    path = Path(root) / f"L{length}" / task / f"{split}.jsonl"
+    if not path.exists():
+        raise FileNotFoundError(f"missing RULER file: {path}")
+
+    samples: list[Sample] = []
+    for line in path.open():
+        row = json.loads(line)
+        samples.append(
+            Sample(
+                sample_id=f"ruler_{task}_{length}_{row['index']}",
+                context_tokens=_encode(tokenizer, row["input"]),
+                target=row["outputs"],
+                metadata={
+                    "benchmark": "ruler",
+                    "task": task,
+                    "length": length,
+                    "index": row["index"],
+                    "tokens_to_generate": RULER_TOKENS_TO_GENERATE[task],
+                    # NIAH only; None for aggregation tasks (cwe/fwe).
+                    "needle_positions": row.get("needle_positions"),
+                    "needle_depths": row.get("needle_depths"),
                 },
             )
         )
