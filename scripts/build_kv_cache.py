@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor
 import shutil
 import sys
 from pathlib import Path
@@ -108,33 +109,45 @@ def dequantize_tensor(d: dict[str, torch.Tensor], scheme: str, dtype: torch.dtyp
 
 
 class QuantizedCache(Cache):
-    """Stores every layer quantized on GPU; returns fp16 K/V for attention.
+    """Stores every layer quantized; returns fp16 K/V for attention.
 
     K is quantized per-channel (axis=-2, over tokens) and V per-token
     (axis=-1, over head_dim). Each chunk re-quantizes the whole prefix, which
     costs O(T) extra traffic per chunk but keeps the code simple and the scales
     global rather than chunk-local.
+
+    `store_device="cpu"` keeps the quantized cache in host RAM and streams only
+    the current layer to the GPU (the project's host-KV layout). On a 32 GB
+    card this is what makes 256K + q8 fit: GPU holds weights + one layer's fp16
+    K/V (~1 GB) instead of all 36 layers' q8 KV (~18 GB).
     """
 
-    def __init__(self, scheme: str, dtype: torch.dtype):
+    def __init__(self, scheme: str, dtype: torch.dtype, store_device: str = "cuda"):
         self.scheme = scheme
         self.dtype = dtype
+        self.store_device = store_device
         self._k: dict[int, dict[str, torch.Tensor]] = {}
         self._v: dict[int, dict[str, torch.Tensor]] = {}
         self._seq_len = 0
 
+    def _to_store(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {n: t.detach().to(self.store_device) for n, t in d.items()}
+
+    def _from_store(self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {n: t.to("cuda") for n, t in d.items()}
+
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         if layer_idx in self._k:
-            k_past = dequantize_tensor(self._k[layer_idx], self.scheme, self.dtype)
-            v_past = dequantize_tensor(self._v[layer_idx], self.scheme, self.dtype)
+            k_past = dequantize_tensor(self._from_store(self._k[layer_idx]), self.scheme, self.dtype)
+            v_past = dequantize_tensor(self._from_store(self._v[layer_idx]), self.scheme, self.dtype)
             k_full = torch.cat([k_past, key_states], dim=-2)
             v_full = torch.cat([v_past, value_states], dim=-2)
             del k_past, v_past
         else:
             k_full, v_full = key_states, value_states
 
-        self._k[layer_idx] = quantize_tensor(k_full, self.scheme, axis=-2)
-        self._v[layer_idx] = quantize_tensor(v_full, self.scheme, axis=-1)
+        self._k[layer_idx] = self._to_store(quantize_tensor(k_full, self.scheme, axis=-2))
+        self._v[layer_idx] = self._to_store(quantize_tensor(v_full, self.scheme, axis=-1))
         self._seq_len = k_full.shape[-2]
         return k_full, v_full
 
@@ -147,14 +160,22 @@ class QuantizedCache(Cache):
     def get_max_length(self) -> int:
         return -1
 
-    def get_mask_sizes(self, cache_position):
+    def get_mask_sizes(self, q_length: int, layer_idx: int = 0):
         # (kv_length, kv_offset): past + current query chunk
-        query_length = cache_position.shape[0] if hasattr(cache_position, "shape") else 1
-        return self._seq_len + query_length, 0
+        return self._seq_len + int(q_length), 0
 
     @property
     def is_initialized(self) -> bool:
         return bool(self._k)
+
+    @property
+    def is_sliding(self) -> list[bool]:
+        # modeling code does `False in past_key_values.is_sliding`
+        return [False] * max(1, len(self._k))
+
+    @property
+    def is_compileable(self) -> bool:
+        return False
 
     def __len__(self) -> int:
         return len(self._k)
@@ -172,25 +193,67 @@ class QuantizedCache(Cache):
 # --------------------------------------------------------------------------- model / prefill
 
 
-def load_model(path: str, weight_bits: int, dtype: torch.dtype):
+def load_model(path: str, weight_bits: int, dtype: torch.dtype, attn: str = "flex_attention"):
+    if attn == "hydra":
+        from hydra_flash_attention import register_attention
+
+        register_attention()
+    kwargs = {"attn_implementation": attn}
     try:  # transformers >= 5 renamed torch_dtype -> dtype
-        model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype)
+        model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype, **kwargs)
     except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype)
+        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype, **kwargs)
     model.eval()
     if weight_bits < 16:
         try:
-            from torchao.quantization import int4_weight_only, int8_weight_only, quantize_
-        except ImportError as exc:
-            raise SystemExit(
-                "torchao is required for weight quantization; install it or pass --weight-bits 16"
-            ) from exc
-        quant_fn = int8_weight_only() if weight_bits == 8 else int4_weight_only(group_size=128)
-        try:
-            quantize_(model, quant_fn)  # CPU-first keeps the 16 GB fp16 copy in host RAM
-        except Exception:  # noqa: BLE001 - some backends require CUDA
-            model.to("cuda")
-            quantize_(model, quant_fn)
+            # torchao >= 0.18 uses config objects
+            from torchao.quantization import (
+                Int4WeightOnlyConfig,
+                Int8WeightOnlyConfig,
+                quantize_,
+            )
+
+            if weight_bits == 8:
+                quant_fn = Int8WeightOnlyConfig()
+            else:
+                if dtype != torch.bfloat16:
+                    raise SystemExit("int4 TILE_PACKED_TO_4D requires --dtype bfloat16")
+                # TILE_PACKED_TO_4D is the only int4 packing format that works
+                # on this stack (PLAIN/PRESHUFFLED need mslk, PLAIN_INT32 is
+                # CPU-only). It requires CUDA + bfloat16.
+                try:
+                    from torchao.quantization.quantize_.workflows.int4.int4_packing_format import (
+                        Int4PackingFormat,
+                    )
+
+                    quant_fn = Int4WeightOnlyConfig(
+                        group_size=128,
+                        int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D,
+                    )
+                except ImportError:
+                    quant_fn = Int4WeightOnlyConfig(group_size=128)
+        except ImportError:
+            try:
+                # older torchao API
+                from torchao.quantization import (
+                    int4_weight_only,
+                    int8_weight_only,
+                    quantize_,
+                )
+
+                quant_fn = (
+                    int8_weight_only()
+                    if weight_bits == 8
+                    else int4_weight_only(group_size=128)
+                )
+            except ImportError as exc:
+                raise SystemExit(
+                    f"torchao weight quantization unavailable ({exc}); "
+                    "install torchao or pass --weight-bits 16"
+                ) from exc
+        # int4 tile-packed tensors are CUDA-only, so quantize after moving.
+        model.to("cuda", dtype)
+        quantize_(model, quant_fn)
     model.to("cuda")
     return model
 
@@ -198,6 +261,8 @@ def load_model(path: str, weight_bits: int, dtype: torch.dtype):
 @torch.no_grad()
 def dense_prefill(model, ids: torch.Tensor, cache, chunk_size: int):
     total = ids.shape[1]
+    if chunk_size <= 0:
+        chunk_size = total  # one pass; flash attention handles the full context
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
         model(
@@ -223,7 +288,18 @@ def cache_is_complete(path: Path, num_layers: int) -> bool:
     return all((path / f"layer_{i:02d}.safetensors").exists() for i in range(num_layers))
 
 
-def save_cache(cache: QuantizedCache, path: Path, meta: dict, tokens: list[int]) -> None:
+class CacheSnapshot:
+    """CPU copy of a QuantizedCache, safe to hand to a writer thread."""
+
+    def __init__(self, cache: QuantizedCache):
+        self._k = {l: {n: t.detach().cpu() for n, t in d.items()} for l, d in cache._k.items()}
+        self._v = {l: {n: t.detach().cpu() for n, t in d.items()} for l, d in cache._v.items()}
+
+    def layers(self):
+        return sorted(self._k)
+
+
+def save_cache(cache: CacheSnapshot, path: Path, meta: dict, tokens: list[int]) -> None:
     tmp = path.parent / (path.name + ".tmp")
     if tmp.exists():
         shutil.rmtree(tmp)
@@ -251,7 +327,7 @@ def save_cache(cache: QuantizedCache, path: Path, meta: dict, tokens: list[int])
 
 
 @torch.no_grad()
-def verify_quantization(model, tokenizer, tokens: list[int], scheme: str, dtype: torch.dtype, prefix: int) -> None:
+def verify_quantization(model, tokenizer, tokens: list[int], scheme: str, dtype: torch.dtype, prefix: int, store_device: str = "cuda") -> None:
     """Compare the quantized cache's last-token logits against an fp16 cache.
 
     The last token is held out of the prefill and fed as the decode query, so
@@ -263,8 +339,8 @@ def verify_quantization(model, tokenizer, tokens: list[int], scheme: str, dtype:
     last = tokens[prefix - 1]
     ids = torch.tensor([prefix_ids], dtype=torch.long, device="cuda")
 
-    ref_cache = QuantizedCache("fp16", dtype)
-    q_cache = QuantizedCache(scheme, dtype)
+    ref_cache = QuantizedCache("fp16", dtype, store_device)
+    q_cache = QuantizedCache(scheme, dtype, store_device)
     dense_prefill(model, ids, ref_cache, chunk_size=1024)
     dense_prefill(model, ids, q_cache, chunk_size=1024)
 
@@ -305,20 +381,44 @@ def main() -> None:
     ap.add_argument("--n-windows", type=int, default=10, help="PG19 windows per length")
     ap.add_argument("--out", default="data/kv_cache")
     ap.add_argument("--quant", default="q8", choices=("fp16", "q8", "q4"))
-    ap.add_argument("--chunk-size", type=int, default=8192)
+    ap.add_argument("--kv-store", default="gpu", choices=("gpu", "cpu"), help="where quantized KV lives; cpu = host-KV")
+    ap.add_argument("--attn", default="hydra", choices=("hydra", "flex_attention", "sdpa"),
+                    help="hydra = mask-free chunked flash attention (recommended)")
+    ap.add_argument("--chunk-size", type=int, default=0, help="tokens per prefill chunk; 0 = whole sequence")
     ap.add_argument("--limit", type=int, default=0, help="max samples per (length, task); 0 = all")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--sync-write", action="store_true", help="write in the main thread (debug)")
     args = ap.parse_args()
 
     dtype = getattr(torch, args.dtype)
+    if not Path(args.model).exists():
+        raise SystemExit(
+            f"model path not found: {args.model}\n"
+            "Download it first, e.g.:\n"
+            "  export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1\n"
+            "  unset ALL_PROXY all_proxy HTTPS_PROXY HTTP_PROXY https_proxy http_proxy\n"
+            "  python -c \"from huggingface_hub import snapshot_download; "
+            "snapshot_download('Qwen/Qwen3-8B-Base', local_dir='data/models/Qwen3-8B-Base')\"\n"
+            "or pass --model /path/to/local/model"
+        )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = load_model(args.model, args.weight_bits, dtype)
+    model = load_model(args.model, args.weight_bits, dtype, args.attn)
     model_tag = f"{Path(args.model).name}-w{args.weight_bits}"
     out_root = Path(args.out)
 
     tasks = args.tasks if args.benchmark == "ruler" else ["pg19"]
     built = skipped = 0
+    executor = ThreadPoolExecutor(max_workers=1)
+    pending: list = []
+
+    def check_pending() -> None:
+        for future in list(pending):
+            if future.done():
+                pending.remove(future)
+                exc = future.exception()
+                if exc is not None:
+                    raise exc
 
     for length in args.lengths:
         for task in tasks:
@@ -339,7 +439,8 @@ def main() -> None:
 
                 print(f"[build] {sample.sample_id} tokens={sample.length} -> {path}")
                 ids = torch.tensor([sample.context_tokens], dtype=torch.long, device="cuda")
-                cache = QuantizedCache(args.quant, dtype)
+                store_device = "cuda" if args.kv_store == "gpu" else "cpu"
+                cache = QuantizedCache(args.quant, dtype, store_device)
                 try:
                     dense_prefill(model, ids, cache, args.chunk_size)
                 except torch.cuda.OutOfMemoryError:
@@ -366,16 +467,20 @@ def main() -> None:
                 }
                 save_cache(cache, path, meta, sample.context_tokens)
                 built += 1
+                print(f"  peak GPU: {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
+                torch.cuda.reset_peak_memory_stats()
 
                 if args.verify and built == 1:
                     verify_quantization(
                         model, tokenizer, sample.context_tokens, args.quant, dtype,
-                        prefix=min(sample.length - 1, 4096),
+                        prefix=min(sample.length - 1, 4096), store_device=store_device,
                     )
 
                 del cache, ids
                 torch.cuda.empty_cache()
 
+    executor.shutdown(wait=True)
+    check_pending()
     print(f"done: built={built} skipped={skipped}")
 
 
